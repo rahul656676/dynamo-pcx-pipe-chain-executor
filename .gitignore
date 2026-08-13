@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+task/tests/agent_out/
+task/out/
+test_out/
+verify_local.py
+task/environment/data/ground_truth.json

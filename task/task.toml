@@ -1,0 +1,133 @@
+artifacts = ["/app/out/state.jsonl", "/app/out/pipes.jsonl", "/app/out/summary.json"]
+
+[task]
+name = "dynamo/pipe-chain-executor"
+description = "Replay a multi-threaded pipe-chain execution log from a custom binary format, applying stateful fork/join semantics, XOR-accumulation writes, and cursor-based pipe reads to reconstruct the final variable state of each session."
+
+[metadata]
+category = "Data Processing and ETL"
+subcategory = "File format parsing and serialization"
+model_tested = "Opus-4.8"
+agent_tested = "Terminus-2"
+task_objective = ["implement", "transform"]
+artifact_type = ["dataset_or_tabular_file", "generated_output_artifact"]
+expert_time_estimate_hours = 6
+difficulty_explanation = """
+The agent must implement a binary format decoder and a stateful multi-thread simulator
+working only from a written specification. The format itself is not the hard part: the
+binary encoding is clean LEB128/zigzag with a straightforward header and dictionary, and
+a careful reader will parse it without trouble.
+
+The difficulty comes from four independent semantic rules that each produce silent, plausible
+wrong answers rather than parse errors or exceptions.
+
+The first is the WRITE accumulate flag. When bit 1 of the flags byte is set, the stored
+value is not a replacement — it is XOR'd with the variable's current value. An agent that
+treats every WRITE as a plain assignment will silently compute wrong values for every
+accumulated variable. The error affects roughly a third of all WRITEs and compounds across
+the session, since later reads and pipe operations use the wrong accumulated state.
+
+The second is JOIN conflict resolution. When a child thread rejoins its parent and both
+have modified the same variable since the FORK, the winner is the thread with the lower
+numeric thread_id — not the thread that wrote last. Every major threading model an agent
+has seen in training uses last-write-wins; the lower-id rule is documented explicitly in
+the spec but counterintuitive enough that most agents will implement the familiar wrong
+version. The error is silent: merged state looks structurally valid, all thread IDs are
+present, the output parses correctly, only specific values are wrong.
+
+The third is the JOIN anchor reset. After conflict resolution, every variable whose name
+is lexicographically greater than or equal to the anchor variable's name is reset to its
+value at the thread's last SYNC checkpoint, or removed if it did not exist at that point.
+Agents that implement the merge without the anchor reset carry stale post-fork values
+into the parent, producing a state that is internally consistent but factually wrong for
+all variables in the affected range.
+
+The fourth is the pipe read cursor. Each pipe maintains a cursor — the running XOR of
+every write-batch size written so far — and a PIPE_READ in normal mode reads from position
+cursor mod len(buffer) rather than from the front. The cursor is not reset by reads and
+is not a simple count. An agent that implements pipes as a standard FIFO queue reads the
+wrong slot on every read after the first write batch, and the error compounds as the pipe
+fills and drains over the course of a session. Additionally, REVERSE toggles the pipe
+between FIFO and LIFO mode, and every SYNC event in the session resets all pipes back to
+FIFO mode regardless of which thread issued it; agents that track pipe reversal per-thread
+rather than per-pipe, or that do not reset pipe mode on SYNC, produce wrong values for
+every read that follows.
+
+Each of the four rules fails silently. All four affect the checksum field in summary.json,
+which is the XOR of all final variable values. Getting the checksum right requires all
+four rules correct simultaneously.
+"""
+solution_explanation = """
+Parse the 20-byte header: verify header_crc32 (zlib.crc32 over bytes 0..15), read
+dict_offset and events_offset, then read the variable dictionary at dict_offset (uvarint
+count, then length-prefixed UTF-8 names).
+
+Walk events from events_offset in file order. Each event begins with uint8 type, uint16 LE
+thread_id, uvarint timestamp_delta, then a type-specific payload.
+
+Maintain per-session state:
+- Per-thread: variable dict (name → value), shared_vars set, last_sync_snapshot,
+  last_sync_anchor, fork_snapshot (saved at FORK), alive flag.
+- Per-pipe: buffer (list of integers), cursor (int, initially 0), reversed flag (bool).
+
+WRITE (0x00): read var_idx, value, flags. If flags & 0x02, compute
+effective_value = thread.vars.get(name, 0) XOR value; otherwise effective_value = value.
+Store. Mark as shared if flags & 0x01.
+
+FORK (0x01): read child_id, n_inherited, var_indices. Create child thread with copies of
+the named variables. Save current variable state as fork_snapshot for both parent and child.
+
+JOIN (0x02): read child_id, anchor_idx. Apply in order:
+(1) For each variable in parent or child's post-fork state: if both modified it, keep the
+value from whichever thread has the lower thread_id. If only child modified it, merge into
+parent. (2) For each variable with name >= anchor_var_name: reset to parent's
+last_sync_snapshot value, or delete if absent from snapshot. Mark child as dead.
+
+PIPE_WRITE (0x03): read pipe_id, n_values, values. Append values to pipe.buffer.
+Update cursor: cursor = cursor XOR n_values.
+
+PIPE_READ (0x04): read pipe_id, dest_var_idx. If buffer is non-empty: if pipe.reversed,
+pop from end; otherwise read and remove buffer[cursor % len(buffer)]. Assign to dest var
+(plain assignment, not accumulate).
+
+REVERSE (0x05): read pipe_id. Toggle pipe.reversed.
+
+SYNC (0x06): read checkpoint_id, anchor_idx. Save thread's current variable state as
+last_sync_snapshot with anchor = variable name at anchor_idx. Reset ALL pipes in session
+to reversed=False.
+
+After all events: output alive threads' variables to state.jsonl, pipe states to
+pipes.jsonl, and aggregate stats (including checksum = XOR of all alive variable values)
+to summary.json.
+"""
+verification_explanation = """
+tests/ground_truth.json was produced by tests/make_dataset.py directly from the source
+event stream before binary encoding, using the same four semantic rules. The verifier loads
+this ground truth and compares it to the agent's output.
+
+Seven tests cover the output. Three check state.jsonl: the exact set of (session,
+thread_id, var) keys, the ordering, and every variable value. Two check pipes.jsonl: the
+exact set of (session, pipe_id) entries and every field value including the remaining
+buffer contents. Two check summary.json: the structure and every field, with the checksum
+providing a single integer that is wrong if any of the four semantic rules were applied
+incorrectly.
+
+All values are integers and are compared exactly. A run where any semantic rule is wrong
+will produce at least one wrong variable value; the checksum catches any such error even
+if individual variable comparison is not run.
+"""
+
+[verifier]
+timeout_sec = 60.0
+
+[agent]
+timeout_sec = 3600.0
+
+[environment]
+build_timeout_sec = 300.0
+cpus = 1
+memory_mb = 2048
+storage_mb = 4096
+gpus = 0
+allow_internet = true
+mcp_servers = []
